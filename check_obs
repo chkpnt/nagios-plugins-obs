@@ -1,0 +1,530 @@
+#!/usr/bin/ruby
+#
+# check_obs - nagios plugin
+#
+#
+# Copyright 2012 Gregor Dschung     
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+require 'rubygems'
+require 'nokogiri'
+require 'net/https'
+require 'uri'
+require 'optparse'
+require 'erb'
+require 'highline/import'
+require 'pp'
+
+# Maybe, I will put this into a gem.
+module NagiosPlugin
+  class Threshold
+    @@NEG_INFINITY = -1.0/0.0
+    @@POS_INFINITY = 1.0/0.0
+  
+    def initialize(value=nil)
+      @range = @@NEG_INFINITY..@@POS_INFINITY
+      @range_str = ''
+      @alert_inside = false
+      parse value
+    end
+  
+    # Parses the given string into a range which specifies the 
+    # threshold used by {#alert} and {#alert?}.
+    #
+    # @param [String] value the threshold as specified in 
+    # {http://nagiosplug.sourceforge.net/developer-guidelines.html#THRESHOLDFORMAT}
+    # @return [Range] the range
+    def parse(value)
+      # I do not find it useful to throw an exception if x..y and y < x.
+      # Instead, it is allowed (but {#alert?} will always return true (or false)).
+      #
+      #  ""  => always alert 
+      #  "@" => never alert
+
+      value = '' if value.nil?
+  
+      @range_str = value
+
+      if value.start_with? '@'
+        value.slice! 0
+        @alert_inside = true
+      end
+    
+      if value.empty?
+        min = @@NEG_INFINITY
+        max = @@POS_INFINITY
+      else
+        # N => :N
+        if not value.include? ':'
+          value.insert 0, ':'
+        end
+    
+        min, max = value.split ':'
+        min = min.empty? ? 0.0 : min == '~' ? @@NEG_INFINITY : min.to_f
+        max = max.nil? ? @@POS_INFINITY : max.to_f
+      end
+      @range = min..max
+    end
+  
+    # Tests the passed on numeric value whether an alert should be triggered.
+    # An alert is triggered, if the value is outside the range, or inside the
+    # range, if the parsed range begins with "@".
+    #
+    # @param [#<=>] value the value to be tested
+    # @return [true, false]
+    #
+    # @see parse
+    def alert?(value)
+      @alert_inside ^ !@range.include?(value)
+    end
+
+    # Like {#alert?}, but returns a symbol specifying why an alert gets triggered
+    # instead of a Boolean.
+    #
+    # @param [#<=>] value the value to be tested
+    # @return [Symbol] the symbols :no_alert, :alert_above, :alert_below or :alert_inside
+    #
+    # @see alert?
+    def alert(value)
+      if value > @range.last
+        return :alert_above
+      elsif value < @range.first
+        return :alert_below
+      elsif @alert_inside
+        return :alert_inside
+      else
+        return :no_alert
+      end
+    end
+
+    # Returns the string passed on to {#parse} or {#initialize} which represents
+    # the threshold range.
+    #
+    # @return [String] the threshold range's string representation 
+    def to_s
+      @range_str
+    end
+
+    def default?
+      @range_str.empty?
+    end
+  end
+
+  class Plugin
+    STATUS = [:ok, :warning, :critical, :unknown]
+    Perfdata = Struct.new :label, :value, :warn, :crit, :min, :max
+
+    attr_accessor :text
+    attr_accessor :status
+    attr_reader :perf
+    attr_reader :perf_crit
+    attr_reader :perf_warn
+    attr_reader :perf_ok
+    
+    def initialize
+      @perf_string = ''
+      @perf = {}
+      @perf_crit = { :alert => [], :alert_above => [], :alert_below => [], :alert_inside => [], :no_alert => [] }
+      @perf_warn = { :alert => [], :alert_above => [], :alert_below => [], :alert_inside => [], :no_alert => [] }
+      @perf_ok = []
+      @text = ''
+      @status = :unknown
+    end
+
+    # Uses the passed on arguments to create a new Perfdada-object,
+    # which is then inserted into the hash @perf under the key
+    # label
+    #
+    # @param [String] label the label
+    # @param [Threshold] warn threshold, warning
+    # @param [Threshold] crit threshold, critical
+    # @param [#<=>] min minimal value
+    # @param [#<=>] min maximal value
+    def add_perf(label, warn=Threshold.new, crit=Threashold.new, min=nil, max=nil)
+      @perf[label] = Perfdata.new(label, nil, warn, crit, min, max)
+    end
+
+    # Sets the performance value for the perfdata object identified
+    # by label.
+    #
+    # @param [String] label the label identifying the perfdata object
+    # @param [#<=>] value the value
+    def set_perf_value(label, value)
+      @perf[label][:value] = value
+    end
+
+    # Returns an array of Perfdata objects, which labels' match
+    # label.
+    #
+    # @param [Regex] label Regex of the label
+    # @return [Array<Perfdata>] the requested perfdata objects
+    def get_perfs_by_label(label)
+      #Hash.select returns an Array until ruby 1.9
+      Hash[@perf.select{ |k,v| k =~ label }].values
+    end
+
+    # Invoces alert? on the critical and warning {#Threshold} objects
+    # and inserts the labels into (the array :alert and (:alert_above,
+    # :alert_below or :alert_inside) of the hashes
+    # (@perf_crit or @perf_warn)) or (into the array @perf_ok).
+    def check_perfs!
+      @perf_crit[:alert].clear; @perf_crit[:alert_above].clear; @perf_crit[:alert_below].clear; @perf_crit[:alert_inside].clear; @perf_crit[:no_alert].clear
+      @perf_warn[:alert].clear; @perf_warn[:alert_above].clear; @perf_warn[:alert_below].clear; @perf_warn[:alert_inside].clear; @perf_warn[:no_alert].clear
+      @perf_ok.clear
+      @perf_string = ''
+
+      @perf.each do |label, perfdata|
+        if perfdata[:crit].alert? perfdata[:value]
+          @perf_crit[:alert].push label
+          @perf_crit[perfdata[:crit].alert perfdata[:value]].push label
+        elsif perfdata[:warn].alert? perfdata[:value]
+          @perf_warn[:alert].push label
+          @perf_warn[perfdata[:warn].alert perfdata[:value]].push label
+        else
+          @perf_ok.push label
+          @perf_crit[:no_alert] = label
+          @perf_warn[:no_alert] = label
+        end
+        
+        tmp_string = " #{label}=#{perfdata[:value]};#{perfdata[:warn]};#{perfdata[:crit]};#{perfdata[:min]};#{perfdata[:max]}"
+        tmp_string.sub! /;+$/, ''
+        @perf_string += tmp_string
+      end
+    end
+
+    # Puts the message to STDOUT and exists the program
+    # with the specified status
+    #
+    # @param optional [Symbol] status :ok, :warning, :critical or :unknown.
+    # Defaults to {#@status}.
+    def done(status=@status)
+      if @perf_string.empty?
+        puts @text
+      else
+        puts "#{@text} |#{@perf_string}"
+      end
+
+      exit STATUS.index status
+    end
+  end
+end
+
+PLUGIN = NagiosPlugin::Plugin.new
+PLUGIN_VERSION = '0.9'
+
+API_BUILD_WORKERSTATUS = ERB.new %q{<%= URI.join options[:apiurl], '/build/_workerstatus'  %>}
+
+SCHEDULER_SPECIAL = %w{dispatcher publisher signer warden}
+SCHEDULER_ARCH = %w{local i586 x86_64 ppc ppc64 s390 s390x ia64 sparc sparcv8 sparcv9 sparcv9v sparc64 sparc64v mips mips64 mipsel mips64el armv4l armv5el armv6el armv7el armv7hl armv8el sh4}
+
+options = { :check => true, :scheduler_special => SCHEDULER_SPECIAL, :scheduler_arch => [], :worker => {}, :packages => {}, :no_proxy => false }
+
+optparse = OptionParser.new do |opts|
+  opts.banner = 'Usage: check_ruby [options]'
+  opts.on('--no-check-certificate', %q{Don't validate the server's certificate.}) { |check| options[:check] = check }
+  opts.on('-A', '--apiurl=APIURL', 'Specify URL to access API server.') { |apiurl| options[:apiurl] = apiurl }
+  opts.on('--http-user=USER', 'Set http user to USER. If option is not used, there is a prompt.') { |user| options[:user] = user }
+  opts.on('--http-password=PASS', 'Set http password to PASS. If option is not used, there is a prompt.') { |pass| options[:pass] = pass }
+  opts.on('--no-proxy', %q{Don't use proxies, even if the appropriate *_proxy environment variable is defined.}) { |no_proxy| options[:no_proxy] = true ^ no_proxy }
+  opts.on('--proxy-user=USER', 'Set proxy user to USER. The proxy itself has to be defined in the environmental variable http[s]_proxy') { |proxy_user| options[:proxy_user] = proxy_user }
+  opts.on('--proxy-password=PASS', 'Set proxy password to PASS. If option is -, there is a prompt.') { |proxy_pass| options[:proxy_pass] = proxy_pass }
+  opts.on('--scheduler-special=SCHEDULER1,SCHEDULER2,...', Array, "Specify the schedulers for special stuff to monitor (default: #{SCHEDULER_SPECIAL.join ', '})") { |scheduler| options[:scheduler_special] = scheduler }
+  opts.on('--scheduler-arch=SCHEDULER1,SCHEDULER2,...', Array, "Specify the schedulers for specific architectues to monitor (options: #{SCHEDULER_ARCH.join ', '})") { |scheduler| options[:scheduler_arch] = scheduler }
+  opts.on('--worker=WORKER_ARCH1,WORKER_ARCH2,...', Array, "Returns performance data for the worker of the specified host-architecture. For each WORKER_ARCH, you may append the following: With ?w<range> or ?c<range> you can specify a warning or critical range for the number of workers. With ?iw<range> or ?ic<range> you can specify a warning or critical range for the number of idle workers. With ?bw<range> or ?bc<range> you can specify a warning or critical range for the number of building workers.") { |worker|
+    # http://nagiosplug.sourceforge.net/developer-guidelines.html#THRESHOLDFORMAT    
+    # I want to be compliant to the plugin-specifications, even if it doesn't make
+    # sense to specify a negative threshold to this plugin.
+    worker.each do |worker_arch|
+      # Don't work with old ruby :-( You would have matcher[:arch], matcher[:warning], ...
+      # matcher = /^(?<arch>[^\?]+)(\?w(?<warning>@?(~|-\d+|\d*):?(-\d+|\d*)))?(\?c(?<critical>@?(~|-\d+|\d*):?(-\d+|\d*)))?/.match worker_arch
+      arch = /^([^\?]+)/.match worker_arch
+      warning = /\?w([^\?]+)/.match worker_arch
+      critical = /\?c([^\?]+)/.match worker_arch
+      idle_warning = /\?iw([^\?]+)/.match worker_arch
+      idle_critical = /\?ic([^\?]+)/.match worker_arch
+      building_warning = /\?bw([^\?]+)/.match worker_arch
+      building_critical = /\?bc([^\?]+)/.match worker_arch
+
+      PLUGIN.add_perf "worker_amount_#{arch[1]}", NagiosPlugin::Threshold.new( warning && warning[1] ), NagiosPlugin::Threshold.new( critical && critical[1] )
+      PLUGIN.add_perf "worker_idle_#{arch[1]}", NagiosPlugin::Threshold.new( idle_warning && idle_warning[1] ), NagiosPlugin::Threshold.new( idle_critical && idle_critical[1] )
+      PLUGIN.add_perf "worker_building_#{arch[1]}", NagiosPlugin::Threshold.new( building_warning && building_warning[1] ), NagiosPlugin::Threshold.new( building_critical && building_critical[1] )
+    end
+  }
+  opts.on('--packages=ARCH1,ARCH2,...', Array, "Returns performance data for the queued and blocked packages of the specified architecture. For each ARCH, you may append the following: With ?w<range> or ?c<range> you can specify a warning or critical range for the number of packages. With ?ww<range> or ?wc<range> you can specify a warning or critical range for the number of waiting packages. With ?bw<range> or ?bc<range> you can specify a warning or critical range for the number of blocked packages.") { |packages|
+    packages.each do |package_arch|
+      arch = /^([^\?]+)/.match package_arch
+      warning = /\?w([^wc\?]+)/.match package_arch
+      critical = /\?c([^wc\?]+)/.match package_arch
+      waiting_warning = /\?ww([^\?]+)/.match package_arch
+      waiting_critical = /\?wc([^\?]+)/.match package_arch
+      blocked_warning = /\?bw([^\?]+)/.match package_arch
+      blocked_critical = /\?bc([^\?]+)/.match package_arch
+      
+      PLUGIN.add_perf "packages_amount_#{arch[1]}", NagiosPlugin::Threshold.new( warning && warning[1] ), NagiosPlugin::Threshold.new( critical && critical[1] )
+      PLUGIN.add_perf "packages_waiting_#{arch[1]}", NagiosPlugin::Threshold.new( waiting_warning && waiting_warning[1] ), NagiosPlugin::Threshold.new( waiting_critical && waiting_critical[1] )
+      PLUGIN.add_perf "packages_blocked_#{arch[1]}", NagiosPlugin::Threshold.new( blocked_warning && blocked_warning[1] ), NagiosPlugin::Threshold.new( blocked_critical && blocked_critical[1])
+    end
+  }
+  opts.on_tail("-h", "--help", "Show this message") do
+    puts opts
+    exit
+  end
+end
+
+
+begin
+  optparse.parse!
+  if options[:user].nil?
+    options[:user] = ask('Username: ') { |q| q.echo = true }
+  end
+  if options[:pass].nil? or options[:pass] == '-'
+    options[:pass] = ask('Password: ') { |q| q.echo = '*' }
+  end
+  if options[:proxy_pass] == '-'
+    options[:proxy_pass] = ask('Password (proxy): ') { |q| q.echo = '*' }
+  end
+
+  mandatory = { :apiurl => '--apiurl', :user => '--http-user', :pass => '--http-password' }
+
+  #Hash.select returns an Array until ruby 1.9
+  missing = Hash[mandatory.select { |k,v| options[k].nil? }]
+  if not missing.empty?
+    PLUGIN.text = "Missing options: #{missing.values.join ', '}\n#{optparse}"
+    PLUGIN.done :unknown
+  end
+rescue OptionParser::InvalidOption, OptionParser::MissingArgument
+  PLUGIN.text = "#{$!.to_s}\n#{optparse}"
+  PLUGIN.done :unknown
+end
+
+# I've tried open-uri first, but it doesn't allow to set the verify_mode
+# in a nice way for older ruby installations
+uri = URI.parse API_BUILD_WORKERSTATUS.result
+if uri.scheme == 'https'
+  env_proxy = ENV['https_proxy'].nil? || ENV['https_proxy'].empty? ? nil : URI.parse(ENV['https_proxy'])
+  env_no_proxy = ENV['no_proxy'].nil? ? '' : ENV['no_proxy']
+  if (not options[:no_proxy]) && (not env_proxy.nil?) && (not env_no_proxy.split(',').map{|x| uri.host.end_with? x.strip.sub(/^\*/,'')}.include? true)
+    env_proxy.user = options[:proxy_user] if env_proxy.user.nil?
+    env_proxy.password = options[:proxy_pass] if env_proxy.password.nil?
+    http = Net::HTTP::Proxy(env_proxy.host, env_proxy.port, env_proxy.user, env_proxy.password).new uri.host, uri.port
+  else
+    http = Net::HTTP.new uri.host, uri.port
+  end
+  http.use_ssl = true
+  if options[:check]
+    http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+  else
+    http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+  end
+elsif uri.scheme == 'http'
+  env_proxy = ENV['http_proxy'].nil? || ENV['http_proxy'].empty? ? nil : URI.parse(ENV['http_proxy'])
+  env_no_proxy = ENV['no_proxy'].nil? ? '' : ENV['no_proxy']
+  if (not options[:no_proxy]) && (not env_proxy.nil?) && (not env_no_proxy.split(',').map{|x| uri.host.end_with? x.strip.sub(/^\*/,'')}.include? true)
+    env_proxy.user = options[:proxy_user] if env_proxy.user.nil?
+    env_proxy.password = options[:proxy_pass] if env_proxy.password.nil?
+    http = Net::HTTP::Proxy(env_proxy.host, env_proxy.port, env_proxy.user, env_proxy.password).new uri.host, uri.port
+  else
+    http = Net::HTTP.new uri.host, uri.port
+  end
+else
+  PLUGIN.text = 'No valid APIURL given'
+  PLUGIN.done :unknown
+end
+
+
+begin
+  request = Net::HTTP::Get.new uri.request_uri, {'User-Agent' => "check_obs/v#{PLUGIN_VERSION} (nagios-plugins-obs #{PLUGIN_VERSION})"}
+  request.basic_auth(options[:user], options[:pass])
+  response = http.request request
+rescue StandardError => e
+  PLUGIN.text = e.message
+  PLUGIN.done :unknown
+end
+
+
+case response
+when Net::HTTPSuccess then
+  xml = Nokogiri::XML response.body
+  result_SCHED_NOTFOUND = []
+  result_SCHED_RUNNING = []
+  result_SCHED_DEAD = []
+  (options[:scheduler_special] | options[:scheduler_arch]).each do |scheduler|
+    node_scheduler = xml.at_xpath "//scheduler[@arch='#{scheduler}']"
+    if node_scheduler.nil?
+      result_SCHED_NOTFOUND.push scheduler
+    else
+      case node_scheduler['state']
+      when 'running' then
+        result_SCHED_RUNNING.push scheduler
+      when 'dead' then
+        result_SCHED_DEAD.push scheduler
+      end
+    end
+  end
+  if !result_SCHED_DEAD.empty?
+    PLUGIN.status = :critical
+    PLUGIN.text = "Dead scheduler (#{result_SCHED_DEAD.join ', '})."
+  elsif !result_SCHED_NOTFOUND.empty?
+    PLUGIN.status = :unknown
+    PLUGIN.text = "Unknown scheduler (#{result_SCHED_NOTFOUND.join ', '})."
+  else
+    PLUGIN.status = :ok
+    PLUGIN.text = 'All schedulers running.'
+  end
+
+  PLUGIN.get_perfs_by_label(/^worker_amount/).each do |perf|
+    arch = /^worker_amount_(.*)$/.match perf[:label]
+    nodeset_worker = xml.xpath "//idle[@hostarch='#{arch[1]}'] | //building[@hostarch='#{arch[1]}']"
+    perf[:value] = nodeset_worker.size
+  end
+
+  PLUGIN.get_perfs_by_label(/^worker_idle/).each do |perf|
+    arch = /^worker_idle_(.*)$/.match perf[:label]
+    nodeset_worker_idle = xml.xpath "//idle[@hostarch='#{arch[1]}']"
+    perf[:value] = nodeset_worker_idle.size
+  end
+
+  PLUGIN.get_perfs_by_label(/^worker_building/).each do |perf|
+    arch = /^worker_building_(.*)$/.match perf[:label]
+    nodeset_worker_building = xml.xpath "//building[@hostarch='#{arch[1]}']"
+    perf[:value] = nodeset_worker_building.size
+  end
+
+  PLUGIN.get_perfs_by_label(/^packages_amount/).each do |perf|
+    arch = /^packages_amount_(.*)$/.match perf[:label]
+    node_packages_waiting = xml.at_xpath "//waiting[@arch='#{arch[1]}']"
+    if node_packages_waiting.nil?
+      tmp = 0
+    else
+      tmp = node_packages_waiting['jobs'].to_i
+    end
+    node_packages_blocked = xml.at_xpath "//blocked[@arch='#{arch[1]}']"
+    if node_packages_blocked.nil?
+    else
+      perf[:value] = tmp + node_packages_blocked['jobs'].to_i
+    end
+  end
+
+  PLUGIN.get_perfs_by_label(/^packages_waiting/).each do |perf|
+    arch = /^packages_waiting_(.*)$/.match perf[:label]
+    node_packages_waiting = xml.at_xpath "//waiting[@arch='#{arch[1]}']"
+    if node_packages_waiting.nil?
+      perf[:value] = 0
+    else
+      perf[:value] = node_packages_waiting['jobs'].to_i
+    end
+  end
+
+  PLUGIN.get_perfs_by_label(/^packages_blocked/).each do |perf|
+    arch = /^packages_blocked_(.*)$/.match perf[:label]
+    node_packages_blocked = xml.at_xpath "//blocked[@arch='#{arch[1]}']"
+    if node_packages_blocked.nil?
+      perf[:value] = 0
+    else
+      perf[:value] = node_packages_blocked['jobs'].to_i
+    end
+  end
+
+  PLUGIN.check_perfs!
+
+  worker_amount_arch_crit    = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+  worker_idle_arch_crit      = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+  worker_building_arch_crit  = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+  packages_amount_arch_crit  = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+  packages_waiting_arch_crit = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+  packages_blocked_arch_crit = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+
+  worker_amount_arch_warn    = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+  worker_idle_arch_warn      = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+  worker_building_arch_warn  = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+  packages_amount_arch_warn  = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+  packages_waiting_arch_warn = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+  packages_blocked_arch_warn = { :alert_above => [], :alert_below => [], :alert_inside => [] }
+
+  [:alert_above, :alert_below, :alert_inside].each do |alert|
+    worker_amount_arch_crit[alert]    = PLUGIN.perf_crit[alert].select{ |v| v=~/^worker_amount/ }.map{ |v| v[/^worker_amount_(.*)/, 1]}
+    worker_idle_arch_crit[alert]      = PLUGIN.perf_crit[alert].select{ |v| v=~/^worker_idle/ }.map{ |v| v[/^worker_idle_(.*)/, 1]}
+    worker_building_arch_crit[alert]  = PLUGIN.perf_crit[alert].select{ |v| v=~/^worker_building/ }.map{ |v| v[/^worker_building_(.*)/, 1]}
+    packages_amount_arch_crit[alert]  = PLUGIN.perf_crit[alert].select{ |v| v=~/^packages_amount/ }.map{ |v| v[/^packages_amount_(.*)/, 1]}
+    packages_waiting_arch_crit[alert] = PLUGIN.perf_crit[alert].select{ |v| v=~/^packages_waiting/ }.map{ |v| v[/^packages_waiting_(.*)/, 1]}
+    packages_blocked_arch_crit[alert] = PLUGIN.perf_crit[alert].select{ |v| v=~/^packages_blocked/ }.map{ |v| v[/^packages_blocked_(.*)/, 1]}
+
+    worker_amount_arch_warn[alert]    = PLUGIN.perf_warn[alert].select{ |v| v=~/^worker_amount/ }.map{ |v| v[/^worker_amount_(.*)/, 1]}
+    worker_idle_arch_warn[alert]      = PLUGIN.perf_warn[alert].select{ |v| v=~/^worker_idle/ }.map{ |v| v[/^worker_idle_(.*)/, 1]}
+    worker_building_arch_warn[alert]  = PLUGIN.perf_warn[alert].select{ |v| v=~/^worker_building/ }.map{ |v| v[/^worker_building_(.*)/, 1]}
+    packages_amount_arch_warn[alert]  = PLUGIN.perf_warn[alert].select{ |v| v=~/^packages_amount/ }.map{ |v| v[/^packages_amount_(.*)/, 1]}
+    packages_waiting_arch_warn[alert] = PLUGIN.perf_warn[alert].select{ |v| v=~/^packages_waiting/ }.map{ |v| v[/^packages_waiting_(.*)/, 1]}
+    packages_blocked_arch_warn[alert] = PLUGIN.perf_warn[alert].select{ |v| v=~/^packages_blocked/ }.map{ |v| v[/^packages_blocked_(.*)/, 1]}
+  end
+  
+  PLUGIN.text += " Far too many workers present (#{worker_amount_arch_crit[:alert_above].join ', '})." unless worker_amount_arch_crit[:alert_above].empty?
+  PLUGIN.text += " Far too many workers idle (#{worker_idle_arch_crit[:alert_above].join ', '})." unless worker_idle_arch_crit[:alert_above].empty?
+  PLUGIN.text += " Far too many workers building (#{worker_building_arch_crit[:alert_above].join ', '})." unless worker_building_arch_crit[:alert_above].empty?
+  PLUGIN.text += " Far too many packages present (#{packages_amount_arch_crit[:alert_above].join ', '})." unless packages_amount_arch_crit[:alert_above].empty?
+  PLUGIN.text += " Far too many packages waiting (#{packages_waiting_arch_crit[:alert_above].join ', '})." unless packages_waiting_arch_crit[:alert_above].empty?
+  PLUGIN.text += " Far too many packages blocked (#{packages_blocked_arch_crit[:alert_above].join ', '})." unless packages_blocked_arch_crit[:alert_above].empty?
+
+  PLUGIN.text += " Far too less workers present (#{worker_amount_arch_crit[:alert_below].join ', '})." unless worker_amount_arch_crit[:alert_below].empty?
+  PLUGIN.text += " Far too less workers idle (#{worker_idle_arch_crit[:alert_below].join ', '})." unless worker_idle_arch_crit[:alert_below].empty?
+  PLUGIN.text += " Far too less workers building (#{worker_building_arch_crit[:alert_below].join ', '})." unless worker_building_arch_crit[:alert_below].empty?
+  PLUGIN.text += " Far too less packages present (#{packages_amount_arch_crit[:alert_below].join ', '})." unless packages_amount_arch_crit[:alert_below].empty?
+  PLUGIN.text += " Far too less packages waiting (#{packages_waiting_arch_crit[:alert_below].join ', '})." unless packages_waiting_arch_crit[:alert_below].empty?
+  PLUGIN.text += " Far too less packages blocked (#{packages_blocked_arch_crit[:alert_below].join ', '})." unless packages_blocked_arch_crit[:alert_below].empty?
+  
+  PLUGIN.text += " Totally wrong number of workers present (#{worker_amount_arch_crit[:alert_inside].join ', '})." unless worker_amount_arch_crit[:alert_inside].empty?
+  PLUGIN.text += " Totally wrong number of workers idle (#{worker_idle_arch_crit[:alert_inside].join ', '})." unless worker_idle_arch_crit[:alert_inside].empty?
+  PLUGIN.text += " Totally wrong number of workers building (#{worker_building_arch_crit[:alert_inside].join ', '})." unless worker_building_arch_crit[:alert_inside].empty?
+  PLUGIN.text += " Totally wrong number of packages present (#{packages_amount_arch_crit[:alert_inside].join ', '})." unless packages_amount_arch_crit[:alert_inside].empty?
+  PLUGIN.text += " Totally wrong number of packages waiting (#{packages_waiting_arch_crit[:alert_inside].join ', '})." unless packages_waiting_arch_crit[:alert_inside].empty?
+  PLUGIN.text += " Totally wrong number of packages blocked (#{packages_blocked_arch_crit[:alert_inside].join ', '})." unless packages_blocked_arch_crit[:alert_inside].empty?
+
+  if not PLUGIN.perf_crit[:alert].empty?
+    PLUGIN.status = :critical if [:ok, :unknown].include? PLUGIN.status
+  end
+  
+  PLUGIN.text += " Too many workers present (#{worker_amount_arch_warn[:alert_above].join ', '})." unless worker_amount_arch_warn[:alert_above].empty?
+  PLUGIN.text += " Too many workers idle (#{worker_idle_arch_warn[:alert_above].join ', '})." unless worker_idle_arch_warn[:alert_above].empty?
+  PLUGIN.text += " Too many workers building (#{worker_building_arch_warn[:alert_above].join ', '})." unless worker_building_arch_warn[:alert_above].empty?
+  PLUGIN.text += " Too many packages present (#{packages_amount_arch_warn[:alert_above].join ', '})." unless packages_amount_arch_warn[:alert_above].empty?
+  PLUGIN.text += " Too many packages waiting (#{packages_waiting_arch_warn[:alert_above].join ', '})." unless packages_waiting_arch_warn[:alert_above].empty?
+  PLUGIN.text += " Too many packages blocked (#{packages_blocked_arch_warn[:alert_above].join ', '})." unless packages_blocked_arch_warn[:alert_above].empty?
+
+  PLUGIN.text += " Too less workers present (#{worker_amount_arch_warn[:alert_below].join ', '})." unless worker_amount_arch_warn[:alert_below].empty?
+  PLUGIN.text += " Too less workers idle (#{worker_idle_arch_warn[:alert_below].join ', '})." unless worker_idle_arch_warn[:alert_below].empty?
+  PLUGIN.text += " Too less workers building (#{worker_building_arch_warn[:alert_below].join ', '})." unless worker_building_arch_warn[:alert_below].empty?
+  PLUGIN.text += " Too less packages present (#{packages_amount_arch_warn[:alert_below].join ', '})." unless packages_amount_arch_warn[:alert_below].empty?
+  PLUGIN.text += " Too less packages waiting (#{packages_waiting_arch_warn[:alert_below].join ', '})." unless packages_waiting_arch_warn[:alert_below].empty?
+  PLUGIN.text += " Too less packages blocked (#{packages_blocked_arch_warn[:alert_below].join ', '})." unless packages_blocked_arch_warn[:alert_below].empty?
+  
+  PLUGIN.text += " Wrong number of workers present (#{worker_amount_arch_warn[:alert_inside].join ', '})." unless worker_amount_arch_warn[:alert_inside].empty?
+  PLUGIN.text += " Wrong number of workers idle (#{worker_idle_arch_warn[:alert_inside].join ', '})." unless worker_idle_arch_warn[:alert_inside].empty?
+  PLUGIN.text += " Wrong number of workers building (#{worker_building_arch_warn[:alert_inside].join ', '})." unless worker_building_arch_warn[:alert_inside].empty?
+  PLUGIN.text += " Wrong number of packages present (#{packages_amount_arch_warn[:alert_inside].join ', '})." unless packages_amount_arch_warn[:alert_inside].empty?
+  PLUGIN.text += " Wrong number of packages waiting (#{packages_waiting_arch_warn[:alert_inside].join ', '})." unless packages_waiting_arch_warn[:alert_inside].empty?
+  PLUGIN.text += " Wrong number of packages blocked (#{packages_blocked_arch_warn[:alert_inside].join ', '})." unless packages_blocked_arch_warn[:alert_inside].empty?
+
+  if not PLUGIN.perf_warn[:alert].empty?
+    PLUGIN.status = :warning if [:ok, :critical, :unknown].include? PLUGIN.status
+  end
+
+  PLUGIN.done
+
+when Net::HTTPUnauthorized then
+  PLUGIN.text = 'Error 401 Unauthorized: are the credentials correct?'
+  PLUGIN.done :unknown
+else
+  PLUGIN.text = 'Unhandled Error'
+  PLUGIN.done :unknown
+end
