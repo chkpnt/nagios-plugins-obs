@@ -232,7 +232,7 @@ SCHEDULER_ARCH = %w{local i586 x86_64 ppc ppc64 s390 s390x ia64 sparc sparcv8 sp
 options = { :check => true, :scheduler_special => SCHEDULER_SPECIAL, :scheduler_arch => [], :worker => {}, :packages => {}, :no_proxy => false }
 
 optparse = OptionParser.new do |opts|
-  opts.banner = 'Usage: check_ruby [options]'
+  opts.banner = 'Usage: check_obs [options]'
   opts.on('--no-check-certificate', %q{Don't validate the server's certificate.}) { |check| options[:check] = check }
   opts.on('-A', '--apiurl=APIURL', 'Specify URL to access API server.') { |apiurl| options[:apiurl] = apiurl }
   opts.on('--http-user=USER', 'Set http user to USER. If option is not used, there is a prompt.') { |user| options[:user] = user }
