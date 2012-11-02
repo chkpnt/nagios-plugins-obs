@@ -3,7 +3,7 @@
 # check_obs - nagios plugin
 #
 #
-# Copyright 2012 Gregor Dschung     
+# Copyright (C) 2012 Gregor Dschung     
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -222,7 +222,7 @@ module NagiosPlugin
 end
 
 PLUGIN = NagiosPlugin::Plugin.new
-PLUGIN_VERSION = '0.9'
+PLUGIN_VERSION = '1.0'
 
 API_BUILD_WORKERSTATUS = ERB.new %q{<%= URI.join options[:apiurl], '/build/_workerstatus'  %>}
 
