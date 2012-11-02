@@ -3,6 +3,8 @@ nagios-plugins-obs
 
 check_obs for nagios
 
+For openSUSE or SLE: it is packaged in the [Open Build Service](https://build.opensuse.org/package/show?package=nagios-plugins-obs&project=home%3Achkpnt%3Aserver%3Amonitoring)
+
 Example
 -------
 
