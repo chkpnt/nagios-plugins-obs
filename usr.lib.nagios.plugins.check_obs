@@ -1,0 +1,14 @@
+# Last Modified: Fri Nov  2 20:27:59 2012
+#include <tunables/global>
+
+/usr/lib/nagios/plugins/check_obs {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/ruby>
+
+  /usr/bin/ruby{,1.9} ix,
+  /usr/bin/stty ix,
+  /usr/lib64/ruby/gems/1.9.1/gems/nokogiri-1.5.2/lib/nokogiri/nokogiri.so mr,
+
+  /usr/lib/nagios/plugins/check_obs r,
+}
