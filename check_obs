@@ -412,6 +412,7 @@ when Net::HTTPSuccess then
     end
     node_packages_blocked = xml.at_xpath "//blocked[@arch='#{arch[1]}']"
     if node_packages_blocked.nil?
+      perf[:value] = tmp
     else
       perf[:value] = tmp + node_packages_blocked['jobs'].to_i
     end
